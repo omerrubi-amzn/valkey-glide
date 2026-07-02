@@ -883,6 +883,27 @@ impl PubSubSynchronizer for GlidePubSubSynchronizer {
     }
 
     async fn intercept_pubsub_command(&self, cmd: &Cmd) -> Option<RedisResult<Value>> {
+        // Fast path (allocation-free): pub/sub interception applies only to the six
+        // subscribe/unsubscribe verbs. Every other command — the overwhelming
+        // majority (e.g. SET/GET), and *all* traffic when pub/sub is unused — is
+        // rejected here by a cheap case-insensitive compare on the borrowed first
+        // arg, skipping the allocating `cmd.command()` (which `to_ascii_uppercase()`
+        // copies the name into a fresh Vec) + `from_utf8` + match that ran on every
+        // command before. Behaviour-identical: `Routable::command` uppercases, so the
+        // original match was itself case-insensitive on the first arg, and any
+        // non-matching verb fell through to `_ => None`.
+        const PUBSUB_VERBS: [&[u8]; 6] = [
+            b"SUBSCRIBE",
+            b"PSUBSCRIBE",
+            b"SSUBSCRIBE",
+            b"UNSUBSCRIBE",
+            b"PUNSUBSCRIBE",
+            b"SUNSUBSCRIBE",
+        ];
+        match cmd.arg_idx(0) {
+            Some(first) if PUBSUB_VERBS.iter().any(|v| first.eq_ignore_ascii_case(v)) => {}
+            _ => return None,
+        }
         let command_name = cmd.command().unwrap_or_default();
         let command_str = std::str::from_utf8(&command_name).unwrap_or("");
 

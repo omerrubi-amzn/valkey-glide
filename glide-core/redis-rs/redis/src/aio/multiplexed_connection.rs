@@ -673,7 +673,22 @@ where
         const DEAD_TICKS: u32 = 2;
         let send_start = std::time::Instant::now();
         let mut no_progress_ticks = 0u32;
-        let permit = loop {
+        // Fast path: if a channel slot is immediately available (the common,
+        // non-contended case) take it without arming the liveness-timeout
+        // machinery — no per-send timeout future, no atomic progress load. The
+        // dead-connection/backpressure detection below is only required when the
+        // channel is actually full, so keep the hot path bare.
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(RedisError::from((
+                    crate::ErrorKind::FatalSendError,
+                    "Failed to send the request to the server",
+                    "the pipeline writer task has terminated".to_string(),
+                )));
+            }
+            // Channel full: fall back to the liveness-aware slow path (unchanged).
+            Err(mpsc::error::TrySendError::Full(())) => loop {
             let progress_before = self.progress.load(Ordering::Relaxed);
             match tokio::time::timeout(liveness_tick, self.sender.reserve()).await {
                 Ok(Ok(permit)) => break permit,
@@ -712,6 +727,7 @@ where
                     }
                 }
             }
+            },
         };
         permit.send(PipelineMessage {
             input,
