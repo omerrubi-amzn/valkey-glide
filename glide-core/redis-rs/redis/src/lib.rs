@@ -402,6 +402,8 @@ pub use crate::{
 mod macros;
 mod pipeline;
 
+pub(crate) mod buf_pool;
+
 #[cfg(feature = "aio")]
 #[cfg_attr(docsrs, doc(cfg(feature = "aio")))]
 pub mod aio;
