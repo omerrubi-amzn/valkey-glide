@@ -141,7 +141,7 @@ impl<W: AsyncWrite> VectoredSink<W> {
     }
 }
 
-impl<W: AsyncWrite> Sink<crate::cmd::SegmentedBytes> for VectoredSink<W> {
+impl<W: AsyncWrite> Sink<crate::cmd::SendBuf> for VectoredSink<W> {
     type Error = RedisError;
 
     fn poll_ready(
@@ -171,30 +171,56 @@ impl<W: AsyncWrite> Sink<crate::cmd::SegmentedBytes> for VectoredSink<W> {
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(
-        self: Pin<&mut Self>,
-        item: crate::cmd::SegmentedBytes,
-    ) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: crate::cmd::SendBuf) -> Result<(), Self::Error> {
         let this = self.project();
-        for segment in item.into_segments() {
-            if segment.is_empty() {
-                continue;
+        match item {
+            // Fast path: a fully packed command with no out-of-line
+            // payloads. One copy into the coalescing scratch, then the Vec
+            // is freed — byte-for-byte what the framed writer's encode step
+            // did, with no segment/Bytes bookkeeping.
+            crate::cmd::SendBuf::Contiguous(buf) => {
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                *this.queued_bytes += buf.len();
+                if buf.len() <= COALESCE_MAX {
+                    this.scratch.extend_from_slice(&buf);
+                    if this.scratch.len() >= SCRATCH_SEAL_BYTES {
+                        this.queue.push_back(this.scratch.split().freeze());
+                    }
+                } else {
+                    if !this.scratch.is_empty() {
+                        this.queue.push_back(this.scratch.split().freeze());
+                    }
+                    // Avoid Bytes::from(Vec)'s shrink-realloc on excess
+                    // capacity.
+                    this.queue.push_back(bytes::Bytes::from_owner(buf));
+                }
             }
-            *this.queued_bytes += segment.len();
-            if segment.len() <= COALESCE_MAX {
-                // Small segment: batch into the contiguous scratch chunk
-                // (one copy — the same copy the framed writer used to do).
-                this.scratch.extend_from_slice(&segment);
-                if this.scratch.len() >= SCRATCH_SEAL_BYTES {
-                    this.queue.push_back(this.scratch.split().freeze());
+            crate::cmd::SendBuf::Segmented(segments) => {
+                for segment in segments.into_segments() {
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    *this.queued_bytes += segment.len();
+                    if segment.len() <= COALESCE_MAX {
+                        // Small segment: batch into the contiguous scratch
+                        // chunk (one copy — the same copy the framed writer
+                        // used to do).
+                        this.scratch.extend_from_slice(&segment);
+                        if this.scratch.len() >= SCRATCH_SEAL_BYTES {
+                            this.queue.push_back(this.scratch.split().freeze());
+                        }
+                    } else {
+                        // Large segment: seal pending small bytes first to
+                        // preserve ordering, then queue the payload
+                        // zero-copy.
+                        if !this.scratch.is_empty() {
+                            this.queue.push_back(this.scratch.split().freeze());
+                        }
+                        this.queue.push_back(segment);
+                    }
                 }
-            } else {
-                // Large segment: seal pending small bytes first to preserve
-                // ordering, then queue the payload zero-copy.
-                if !this.scratch.is_empty() {
-                    this.queue.push_back(this.scratch.split().freeze());
-                }
-                this.queue.push_back(segment);
             }
         }
         Ok(())
@@ -238,9 +264,9 @@ where
     }
 }
 
-impl<R, W> Sink<crate::cmd::SegmentedBytes> for SplitSinkStream<R, W>
+impl<R, W> Sink<crate::cmd::SendBuf> for SplitSinkStream<R, W>
 where
-    W: Sink<crate::cmd::SegmentedBytes, Error = RedisError>,
+    W: Sink<crate::cmd::SendBuf, Error = RedisError>,
 {
     type Error = RedisError;
 
@@ -248,10 +274,7 @@ where
         self.project().write.poll_ready(cx)
     }
 
-    fn start_send(
-        self: Pin<&mut Self>,
-        item: crate::cmd::SegmentedBytes,
-    ) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: crate::cmd::SendBuf) -> Result<(), Self::Error> {
         self.project().write.start_send(item)
     }
 
@@ -1026,7 +1049,7 @@ where
 /// on the same underlying connection (tcp/unix socket).
 #[derive(Clone)]
 pub struct MultiplexedConnection {
-    pipeline: Pipeline<crate::cmd::SegmentedBytes>,
+    pipeline: Pipeline<crate::cmd::SendBuf>,
     db: i64,
     response_timeout: Duration,
     protocol: ProtocolVersion,
@@ -1152,7 +1175,13 @@ impl MultiplexedConnection {
         let result = self
             .pipeline
             .send_single(
-                cmd.get_packed_segments(),
+                // Commands with no out-of-line payloads skip the segmented
+                // representation entirely (see SendBuf::Contiguous).
+                if cmd.has_out_of_line_args() {
+                    crate::cmd::SendBuf::Segmented(cmd.get_packed_segments())
+                } else {
+                    crate::cmd::SendBuf::Contiguous(cmd.get_packed_command())
+                },
                 timeout,
                 cmd.is_fenced(),
                 cmd.is_blocking(),
@@ -1193,7 +1222,7 @@ impl MultiplexedConnection {
         let result = self
             .pipeline
             .send_recv(
-                cmd.get_packed_pipeline_segments(),
+                crate::cmd::SendBuf::Segmented(cmd.get_packed_pipeline_segments()),
                 Some(offset + count),
                 self.response_timeout,
                 cmd.is_atomic(),
@@ -1245,9 +1274,7 @@ impl MultiplexedConnection {
     }
 
     /// Creates a new `MultiplexedConnectionBuilder` for constructing a `MultiplexedConnection`.
-    pub(crate) fn builder(
-        pipeline: Pipeline<crate::cmd::SegmentedBytes>,
-    ) -> MultiplexedConnectionBuilder {
+    pub(crate) fn builder(pipeline: Pipeline<crate::cmd::SendBuf>) -> MultiplexedConnectionBuilder {
         MultiplexedConnectionBuilder::new(pipeline)
     }
 
@@ -1262,7 +1289,7 @@ impl MultiplexedConnection {
 
 /// A builder for creating `MultiplexedConnection` instances.
 pub struct MultiplexedConnectionBuilder {
-    pipeline: Pipeline<crate::cmd::SegmentedBytes>,
+    pipeline: Pipeline<crate::cmd::SendBuf>,
     db: Option<i64>,
     response_timeout: Option<Duration>,
     push_manager: Option<PushManager>,
@@ -1276,7 +1303,7 @@ pub struct MultiplexedConnectionBuilder {
 
 impl MultiplexedConnectionBuilder {
     /// Creates a new builder with the required pipeline
-    pub(crate) fn new(pipeline: Pipeline<crate::cmd::SegmentedBytes>) -> Self {
+    pub(crate) fn new(pipeline: Pipeline<crate::cmd::SendBuf>) -> Self {
         Self {
             pipeline,
             db: None,

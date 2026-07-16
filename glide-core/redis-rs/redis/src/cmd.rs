@@ -436,6 +436,33 @@ impl From<Vec<u8>> for SegmentedBytes {
     }
 }
 
+/// A packed request travelling to a connection's write task.
+///
+/// Commands with no out-of-line payloads travel as the plain packed byte
+/// buffer (`Contiguous`) — the exact representation the framed writer used,
+/// with no segment container, `Bytes` conversion, or refcount bookkeeping on
+/// the hot path. Only commands carrying large shared payloads pay for the
+/// segmented representation.
+#[derive(Debug, Clone)]
+pub enum SendBuf {
+    /// Fully packed command bytes (no out-of-line payloads).
+    Contiguous(Vec<u8>),
+    /// Framing segments interleaved with zero-copy payload segments.
+    Segmented(SegmentedBytes),
+}
+
+impl From<Vec<u8>> for SendBuf {
+    fn from(buf: Vec<u8>) -> Self {
+        SendBuf::Contiguous(buf)
+    }
+}
+
+impl From<SegmentedBytes> for SendBuf {
+    fn from(segments: SegmentedBytes) -> Self {
+        SendBuf::Segmented(segments)
+    }
+}
+
 impl RedisWrite for Cmd {
     fn write_arg(&mut self, arg: &[u8]) {
         if arg.len() > SHARED_ARG_INLINE_MAX {
@@ -629,7 +656,10 @@ impl Cmd {
         let mut out = SegmentedBytes::default();
         let mut scratch = Vec::new();
         self.write_packed_segments(&mut out, &mut scratch);
-        out.push(bytes::Bytes::from(scratch));
+        // from_owner: Bytes::from(Vec) shrinks-to-fit when capacity > len
+        // (the reserve above over-estimates), which reallocs + copies the
+        // whole packed command. from_owner keeps the Vec as-is.
+        out.push(bytes::Bytes::from_owner(scratch));
         out
     }
 
@@ -687,7 +717,7 @@ impl Cmd {
                     scratch.extend_from_slice(b"\r\n");
                     // Flush framing accumulated so far, then emit the payload
                     // as its own zero-copy segment.
-                    out.push(bytes::Bytes::from(std::mem::take(scratch)));
+                    out.push(bytes::Bytes::from_owner(std::mem::take(scratch)));
                     out.push(payload.clone());
                     scratch.extend_from_slice(b"\r\n");
                 }
