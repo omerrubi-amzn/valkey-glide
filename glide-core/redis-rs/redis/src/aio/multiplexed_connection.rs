@@ -41,36 +41,17 @@ const VECTORED_SINK_HIGH_WATERMARK: usize = 512 * 1024;
 /// Max iovec entries per `write_vectored` call (typical kernel UIO_MAXIOV is
 /// 1024; 64 keeps the stack array small while amortizing syscalls well).
 const MAX_WRITE_SLICES: usize = 64;
-/// Segments at or below this size are coalesced into a contiguous scratch
-/// buffer instead of getting their own iovec entry. Small pipelined commands
-/// then batch into large contiguous writes exactly like the pre-vectored
-/// framed writer did — without this, per-command segments changed the write
-/// batching cadence and cost 10-20% throughput on sub-4KB commands at high
-/// pipeline depth. Large (shared/pooled payload) segments stay zero-copy.
-const COALESCE_MAX: usize = 4 * 1024;
-/// Start driving writes from `poll_ready` once this many bytes are pending —
-/// tokio `FramedWrite`'s backpressure boundary, so small-command batching and
-/// write overlap match the framed writer's cadence.
-const WRITE_EAGER_BOUNDARY: usize = 8 * 1024;
-/// Seal the scratch buffer into the queue once it reaches this size, keeping
-/// coalesced chunks (and scratch regrowth) bounded.
-const SCRATCH_SEAL_BYTES: usize = 32 * 1024;
 
 pin_project! {
     /// Send-side zero-copy sink: queues the segments of packed commands and
     /// writes them with vectored I/O. Large shared payloads
     /// ([`crate::cmd::SegmentedBytes`]) go from the caller's allocation
     /// straight to the socket without ever being copied into a write buffer;
-    /// small segments coalesce into contiguous chunks (see [`COALESCE_MAX`]).
+    /// straight to the socket without ever being copied into a write buffer.
     struct VectoredSink<W> {
         #[pin]
         writer: W,
         queue: VecDeque<bytes::Bytes>,
-        // Trailing coalescing buffer for small segments; logically ordered
-        // AFTER everything in `queue`. Sealed (split+frozen into `queue`)
-        // before any write, when a large segment must follow it, or when it
-        // reaches SCRATCH_SEAL_BYTES.
-        scratch: bytes::BytesMut,
         queued_bytes: usize,
     }
 }
@@ -80,7 +61,6 @@ impl<W> VectoredSink<W> {
         VectoredSink {
             writer,
             queue: VecDeque::new(),
-            scratch: bytes::BytesMut::new(),
             queued_bytes: 0,
         }
     }
@@ -94,13 +74,6 @@ impl<W: AsyncWrite> VectoredSink<W> {
         cx: &mut task::Context,
     ) -> Poll<Result<(), RedisError>> {
         let mut this = self.project();
-        // Seal any pending coalesced bytes so they participate in the write.
-        // split() hands the accumulated chunk off zero-copy; the scratch
-        // allocation is reclaimed by a later `extend_from_slice`'s reserve
-        // once the frozen chunk (written and dropped) releases it.
-        if !this.scratch.is_empty() {
-            this.queue.push_back(this.scratch.split().freeze());
-        }
         loop {
             if this.queue.is_empty() {
                 return this
@@ -144,80 +117,27 @@ impl<W: AsyncWrite> VectoredSink<W> {
 impl<W: AsyncWrite> Sink<crate::cmd::SendBuf> for VectoredSink<W> {
     type Error = RedisError;
 
-    fn poll_ready(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context,
-    ) -> Poll<Result<(), Self::Error>> {
-        // Eagerly drive pending bytes into the socket once a small batch has
-        // accumulated, mirroring tokio's FramedWrite backpressure boundary
-        // (8KB): transmission then overlaps with continued queueing. Without
-        // this, small pipelined commands accumulated until the driver's
-        // explicit flush (request stream idle), producing bursty writes and
-        // +60..100us p50 at high pipeline depth.
-        if self.queued_bytes >= WRITE_EAGER_BOUNDARY {
-            let flushed = self.as_mut().poll_flush_queue(cx);
-            if let Poll::Ready(Err(err)) = flushed {
-                return Poll::Ready(Err(err));
-            }
-            // Accept more items unless we're above the high watermark —
-            // Pending from the writer only defers the WRITE, not readiness.
-            if self.queued_bytes > VECTORED_SINK_HIGH_WATERMARK {
-                return match flushed {
-                    Poll::Ready(res) => Poll::Ready(res),
-                    Poll::Pending => Poll::Pending,
-                };
-            }
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
+        if self.queued_bytes <= VECTORED_SINK_HIGH_WATERMARK {
+            return Poll::Ready(Ok(()));
         }
-        Poll::Ready(Ok(()))
+        // Backpressure: drain before accepting more.
+        self.poll_flush_queue(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, item: crate::cmd::SendBuf) -> Result<(), Self::Error> {
         let this = self.project();
         match item {
-            // Fast path: a fully packed command with no out-of-line
-            // payloads. One copy into the coalescing scratch, then the Vec
-            // is freed — byte-for-byte what the framed writer's encode step
-            // did, with no segment/Bytes bookkeeping.
             crate::cmd::SendBuf::Contiguous(buf) => {
-                if buf.is_empty() {
-                    return Ok(());
-                }
-                *this.queued_bytes += buf.len();
-                if buf.len() <= COALESCE_MAX {
-                    this.scratch.extend_from_slice(&buf);
-                    if this.scratch.len() >= SCRATCH_SEAL_BYTES {
-                        this.queue.push_back(this.scratch.split().freeze());
-                    }
-                } else {
-                    if !this.scratch.is_empty() {
-                        this.queue.push_back(this.scratch.split().freeze());
-                    }
-                    // Avoid Bytes::from(Vec)'s shrink-realloc on excess
-                    // capacity.
+                if !buf.is_empty() {
+                    *this.queued_bytes += buf.len();
                     this.queue.push_back(bytes::Bytes::from_owner(buf));
                 }
             }
             crate::cmd::SendBuf::Segmented(segments) => {
                 for segment in segments.into_segments() {
-                    if segment.is_empty() {
-                        continue;
-                    }
-                    *this.queued_bytes += segment.len();
-                    if segment.len() <= COALESCE_MAX {
-                        // Small segment: batch into the contiguous scratch
-                        // chunk (one copy — the same copy the framed writer
-                        // used to do).
-                        this.scratch.extend_from_slice(&segment);
-                        if this.scratch.len() >= SCRATCH_SEAL_BYTES {
-                            this.queue.push_back(this.scratch.split().freeze());
-                        }
-                    } else {
-                        // Large segment: seal pending small bytes first to
-                        // preserve ordering, then queue the payload
-                        // zero-copy.
-                        if !this.scratch.is_empty() {
-                            this.queue.push_back(this.scratch.split().freeze());
-                        }
+                    if !segment.is_empty() {
+                        *this.queued_bytes += segment.len();
                         this.queue.push_back(segment);
                     }
                 }
