@@ -41,16 +41,32 @@ const VECTORED_SINK_HIGH_WATERMARK: usize = 512 * 1024;
 /// Max iovec entries per `write_vectored` call (typical kernel UIO_MAXIOV is
 /// 1024; 64 keeps the stack array small while amortizing syscalls well).
 const MAX_WRITE_SLICES: usize = 64;
+/// Segments at or below this size are coalesced into a contiguous scratch
+/// buffer instead of getting their own iovec entry. Small pipelined commands
+/// then batch into large contiguous writes exactly like the pre-vectored
+/// framed writer did — without this, per-command segments changed the write
+/// batching cadence and cost 10-20% throughput on sub-4KB commands at high
+/// pipeline depth. Large (shared/pooled payload) segments stay zero-copy.
+const COALESCE_MAX: usize = 4 * 1024;
+/// Seal the scratch buffer into the queue once it reaches this size, keeping
+/// coalesced chunks (and scratch regrowth) bounded.
+const SCRATCH_SEAL_BYTES: usize = 32 * 1024;
 
 pin_project! {
     /// Send-side zero-copy sink: queues the segments of packed commands and
     /// writes them with vectored I/O. Large shared payloads
     /// ([`crate::cmd::SegmentedBytes`]) go from the caller's allocation
-    /// straight to the socket without ever being copied into a write buffer.
+    /// straight to the socket without ever being copied into a write buffer;
+    /// small segments coalesce into contiguous chunks (see [`COALESCE_MAX`]).
     struct VectoredSink<W> {
         #[pin]
         writer: W,
         queue: VecDeque<bytes::Bytes>,
+        // Trailing coalescing buffer for small segments; logically ordered
+        // AFTER everything in `queue`. Sealed (split+frozen into `queue`)
+        // before any write, when a large segment must follow it, or when it
+        // reaches SCRATCH_SEAL_BYTES.
+        scratch: bytes::BytesMut,
         queued_bytes: usize,
     }
 }
@@ -60,6 +76,7 @@ impl<W> VectoredSink<W> {
         VectoredSink {
             writer,
             queue: VecDeque::new(),
+            scratch: bytes::BytesMut::new(),
             queued_bytes: 0,
         }
     }
@@ -73,6 +90,13 @@ impl<W: AsyncWrite> VectoredSink<W> {
         cx: &mut task::Context,
     ) -> Poll<Result<(), RedisError>> {
         let mut this = self.project();
+        // Seal any pending coalesced bytes so they participate in the write.
+        // split() hands the accumulated chunk off zero-copy; the scratch
+        // allocation is reclaimed by a later `extend_from_slice`'s reserve
+        // once the frozen chunk (written and dropped) releases it.
+        if !this.scratch.is_empty() {
+            this.queue.push_back(this.scratch.split().freeze());
+        }
         loop {
             if this.queue.is_empty() {
                 return this
@@ -130,8 +154,23 @@ impl<W: AsyncWrite> Sink<crate::cmd::SegmentedBytes> for VectoredSink<W> {
     ) -> Result<(), Self::Error> {
         let this = self.project();
         for segment in item.into_segments() {
-            if !segment.is_empty() {
-                *this.queued_bytes += segment.len();
+            if segment.is_empty() {
+                continue;
+            }
+            *this.queued_bytes += segment.len();
+            if segment.len() <= COALESCE_MAX {
+                // Small segment: batch into the contiguous scratch chunk
+                // (one copy — the same copy the framed writer used to do).
+                this.scratch.extend_from_slice(&segment);
+                if this.scratch.len() >= SCRATCH_SEAL_BYTES {
+                    this.queue.push_back(this.scratch.split().freeze());
+                }
+            } else {
+                // Large segment: seal pending small bytes first to preserve
+                // ordering, then queue the payload zero-copy.
+                if !this.scratch.is_empty() {
+                    this.queue.push_back(this.scratch.split().freeze());
+                }
                 this.queue.push_back(segment);
             }
         }
