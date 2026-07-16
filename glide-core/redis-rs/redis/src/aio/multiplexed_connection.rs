@@ -48,6 +48,10 @@ const MAX_WRITE_SLICES: usize = 64;
 /// batching cadence and cost 10-20% throughput on sub-4KB commands at high
 /// pipeline depth. Large (shared/pooled payload) segments stay zero-copy.
 const COALESCE_MAX: usize = 4 * 1024;
+/// Start driving writes from `poll_ready` once this many bytes are pending —
+/// tokio `FramedWrite`'s backpressure boundary, so small-command batching and
+/// write overlap match the framed writer's cadence.
+const WRITE_EAGER_BOUNDARY: usize = 8 * 1024;
 /// Seal the scratch buffer into the queue once it reaches this size, keeping
 /// coalesced chunks (and scratch regrowth) bounded.
 const SCRATCH_SEAL_BYTES: usize = 32 * 1024;
@@ -140,12 +144,31 @@ impl<W: AsyncWrite> VectoredSink<W> {
 impl<W: AsyncWrite> Sink<crate::cmd::SegmentedBytes> for VectoredSink<W> {
     type Error = RedisError;
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut task::Context) -> Poll<Result<(), Self::Error>> {
-        if self.queued_bytes <= VECTORED_SINK_HIGH_WATERMARK {
-            return Poll::Ready(Ok(()));
+    fn poll_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context,
+    ) -> Poll<Result<(), Self::Error>> {
+        // Eagerly drive pending bytes into the socket once a small batch has
+        // accumulated, mirroring tokio's FramedWrite backpressure boundary
+        // (8KB): transmission then overlaps with continued queueing. Without
+        // this, small pipelined commands accumulated until the driver's
+        // explicit flush (request stream idle), producing bursty writes and
+        // +60..100us p50 at high pipeline depth.
+        if self.queued_bytes >= WRITE_EAGER_BOUNDARY {
+            let flushed = self.as_mut().poll_flush_queue(cx);
+            if let Poll::Ready(Err(err)) = flushed {
+                return Poll::Ready(Err(err));
+            }
+            // Accept more items unless we're above the high watermark —
+            // Pending from the writer only defers the WRITE, not readiness.
+            if self.queued_bytes > VECTORED_SINK_HIGH_WATERMARK {
+                return match flushed {
+                    Poll::Ready(res) => Poll::Ready(res),
+                    Poll::Pending => Poll::Pending,
+                };
+            }
         }
-        // Backpressure: drain before accepting more.
-        self.poll_flush_queue(cx)
+        Poll::Ready(Ok(()))
     }
 
     fn start_send(
