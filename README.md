@@ -1,5 +1,12 @@
 # Welcome to Valkey GLIDE!
 
+[![GitHub Release](https://img.shields.io/github/v/release/valkey-io/valkey-glide)](https://github.com/valkey-io/valkey-glide/releases)
+[![PyPI](https://img.shields.io/pypi/v/valkey-glide?label=PyPI)](https://pypi.org/project/valkey-glide/)
+[![npm](https://img.shields.io/npm/v/%40valkey%2Fvalkey-glide?label=npm)](https://www.npmjs.com/package/@valkey/valkey-glide)
+[![Maven Central](https://img.shields.io/maven-central/v/io.valkey/valkey-glide?label=Maven%20Central)](https://central.sonatype.com/artifact/io.valkey/valkey-glide)
+[![Go Reference](https://pkg.go.dev/badge/github.com/valkey-io/valkey-glide/go/v2.svg)](https://pkg.go.dev/github.com/valkey-io/valkey-glide/go/v2)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](./LICENSE)
+
 Valkey General Language Independent Driver for the Enterprise (GLIDE) is an official open-source Valkey client library, proudly part of the Valkey organization. Our mission is to make your experience with Valkey and Redis OSS seamless and enjoyable. Whether you're a seasoned developer or just starting out, Valkey GLIDE is here to support you every step of the way.
 
 Visit our official documentation at [glide.valkey.io](https://glide.valkey.io).
@@ -15,7 +22,7 @@ Visit our official documentation at [glide.valkey.io](https://glide.valkey.io).
 - **Backed and Supported by AWS and GCP**: Ensuring robust support and continuous improvement of the project.
 
 ## Key Features
-- **[AZ Affinity](https://valkey.io/blog/az-affinity-strategy/)** – Ensures low-latency connections and minimal cross-zone costs by routing read traffic to replicas in the clients availability zone. **(Requires Valkey server version 8.0+ or AWS ElastiCache for Valkey 7.2+)**.
+- **[AZ Affinity](https://valkey.io/blog/az-affinity-strategy/)** – Ensures low-latency connections and minimal cross-zone costs by routing read traffic to replicas in the client's availability zone. **(Requires Valkey server version 8.0+ or AWS ElastiCache for Valkey 7.2+)**.
 - **[PubSub Auto-Reconnection](https://glide.valkey.io/concepts/client-features/pubsub-model/)** – Seamless background resubscription on topology updates or disconnection.
 - **[Sharded PubSub](https://glide.valkey.io/concepts/client-features/pubsub-model/)** – Native support for sharded PubSub across cluster slots.
 - **[Cluster-Aware MGET/MSET/DEL/FLUSHALL](https://glide.valkey.io/concepts/client-features/multi-slot-command-handling/)** – Execute multi-key commands across cluster slots without manual key grouping.
@@ -46,13 +53,35 @@ The following are some of the changes planned for 2.4.0 release:
 - Add NodeDiscoveryMode option for all languages
 - Further improvements and fixes.
 
-For the detailed list of changes, see the release [page](https://github.com/valkey-io/valkey-glide/releases/tag/v2.4.0).
+For the detailed list of changes, see the [releases page](https://github.com/valkey-io/valkey-glide/releases) once v2.4.0 is published.
 
 ### Other Releases
 
 See our releases [section](https://github.com/valkey-io/valkey-glide/releases)
 
 ## Getting Started
+
+**Quick Start (Python)**
+
+```bash
+pip install valkey-glide
+```
+
+```python
+import asyncio
+from glide import GlideClientConfiguration, NodeAddress, GlideClient
+
+async def main():
+    # It is recommended to set a timeout for your specific use case
+    config = GlideClientConfiguration([NodeAddress("localhost", 6379)], request_timeout=500)
+    client = await GlideClient.create(config)
+    await client.set("foo", "bar")
+    print(await client.get("foo"))  # bar
+
+asyncio.run(main())
+```
+
+The same API is available in all supported languages — see the quickstart guides below.
 
 **Documentation**
 Visit our official Valkey GLIDE's documentation [site](https://glide.valkey.io/overview/).
@@ -62,7 +91,7 @@ Visit our official Valkey GLIDE's documentation [site](https://glide.valkey.io/o
 - [Python](https://glide.valkey.io/getting-started/quickstart/?lang=python)
 - [Node](https://glide.valkey.io/getting-started/quickstart/?lang=node)
 - [Go](https://glide.valkey.io/getting-started/quickstart/?lang=go)
-- [Php](https://glide.valkey.io/getting-started/quickstart/?lang=php)
+- [PHP](https://glide.valkey.io/getting-started/quickstart/?lang=php)
 
 **Under Development SDKs**
 - [C#](https://github.com/valkey-io/valkey-glide-csharp)
@@ -124,7 +153,12 @@ Using these commands with compressed values will result in incorrect behavior or
 
 ## Getting Help
 
-If you have any questions, feature requests, encounter issues, or need assistance with this project, please don't hesitate to open a GitHub issue. Our community and contributors are here to help you. Before creating an issue, we recommend checking the [existing issues](https://github.com/valkey-io/valkey-glide/issues) to see if your question or problem has already been addressed. If not, feel free to create a new issue, and we'll do our best to assist you. Please provide as much detail as possible in your issue description, including:
+If you have questions, feature requests, or run into issues, we're here to help:
+
+- **GitHub Issues**: Check the [existing issues](https://github.com/valkey-io/valkey-glide/issues) first; if your question or problem isn't covered, open a new issue.
+- **Valkey Slack**: Approach us for anything on our Valkey Slack: [Join Valkey Slack](https://join.slack.com/t/valkey-oss-developer/shared_invite/zt-2nxs51chx-EB9hu9Qdch3GMfRcztTSkQ).
+
+When opening an issue, please provide as much detail as possible, including:
 
 1. A clear and concise title
 2. Detailed description of the problem or question
@@ -139,17 +173,11 @@ If you have any questions, feature requests, encounter issues, or need assistanc
 
 ## Contributing
 
-GitHub is a platform for collaborative coding. If you're interested in writing code, we encourage you to contribute by submitting pull requests from forked copies of this repository. Additionally, please consider creating GitHub issues for reporting bugs and suggesting new features. Feel free to comment on issues that interest. For more info see [Contributing](./CONTRIBUTING.md).
+We invite you to join our open-source community and contribute to Valkey GLIDE. Whether it's reporting bugs, suggesting new features, commenting on issues that interest you, or submitting pull requests from forked copies of this repository, your contributions are highly valued. Check out our [Contributing Guidelines](./CONTRIBUTING.md) to get started.
 
-## Get Involved!
+## Security
 
-We invite you to join our open-source community and contribute to Valkey GLIDE. Whether it's reporting bugs, suggesting new features, or submitting pull requests, your contributions are highly valued. Check out our [Contributing Guidelines](./CONTRIBUTING.md) to get started.
-
-If you have any questions or need assistance, don't hesitate to reach out. Open a GitHub issue, and our community and contributors will be happy to help you.
-
-## Community Support and Feedback
-
-We encourage you to join our community to support, share feedback, and ask questions. You can approach us for anything on our Valkey Slack: [Join Valkey Slack](https://join.slack.com/t/valkey-oss-developer/shared_invite/zt-2nxs51chx-EB9hu9Qdch3GMfRcztTSkQ).
+To report a security vulnerability, please see our [Security Policy](./SECURITY.md).
 
 ## License
 * [Apache License 2.0](./LICENSE)
